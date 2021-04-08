@@ -1,0 +1,50 @@
+From 372e4be6d934f90eb021aeeecacb9470b2828605 Mon Sep 17 00:00:00 2001
+From: Kslr <hi@kslr.org>
+Date: Mon, 17 Aug 2020 23:51:57 +0800
+Subject: [PATCH 1/5] update readme (#18)
+
+---
+ readme.md              | 4 ++--
+ v2ray_config/readme.md | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/readme.md b/readme.md
+index 9fe065a..ad56083 100644
+--- a/readme.md
++++ b/readme.md
+@@ -217,7 +217,7 @@ sudo systemctl restart cgproxy.service
+   sudo setcap "cap_net_admin,cap_net_bind_service=ep" /usr/lib/v2ray/v2ray
+   ```
+ 
+-- Why not outbound mark solution, because in v2ray [when `"localhost"` is used, out-going DNS traffic is not controlled by V2Ray](https://www.v2fly.org/en/configuration/dns.html), so no mark at all, that's pity.
++- Why not outbound mark solution, because in v2ray [when `"localhost"` is used, out-going DNS traffic is not controlled by V2Ray](https://www.v2fly.org/config/dns.html#dnsobject), so no mark at all, that's pity.
+ 
+ ## TIPS
+ 
+@@ -227,7 +227,7 @@ sudo systemctl restart cgproxy.service
+ - Offer you qv2ray config example
+   
+ 
+-![Qv2ray config example](https://i.loli.net/2020/06/12/6ltax93bv7NCTHU.png)
++![Qv2ray config example](https://i.loli.net/2020/08/17/P6y5SfLoUwGjaxM.png)
+ 
+ ## Licences
+ 
+diff --git a/v2ray_config/readme.md b/v2ray_config/readme.md
+index 2335beb..f415a71 100644
+--- a/v2ray_config/readme.md
++++ b/v2ray_config/readme.md
+@@ -1,8 +1,8 @@
+ ## Usage
+-- Fill `06_outbounds_myproxy.json` with your vmess proxy config with tag `outBound_PROXY`.
++- Fill `06_outbounds_myproxy.json` with your VMess proxy config with tag `outBound_PROXY`.
+ - Start with  `sudo v2ray -confdir .`
+ 
+ ## Reference
+ 
+-- [v2ray multi-file config](https://www.v2fly.org/chapter_02/multiple_config.html)
++- [v2ray multi-file config](https://www.v2fly.org/config/multiple_config.html)
+ 
+-- 
+2.30.2
+

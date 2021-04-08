@@ -1,0 +1,57 @@
+From 5902a649262a5b6468a1f937f0526d06ca3aa1fe Mon Sep 17 00:00:00 2001
+From: Fancy Zhang <springzfx@gmail.com>
+Date: Wed, 19 Aug 2020 21:46:51 +0800
+Subject: [PATCH 2/5] use CMAKE_INSTALL_FULL_XXX instead because cmake's
+ install DESTINATION not work as doc says
+
+---
+ CMakeLists.txt     | 8 ++++----
+ src/CMakeLists.txt | 2 +-
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fdbbcd6..83d49f8 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.14)
+ set(CMAKE_CXX_STANDARD 17)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+-project(cgproxy VERSION 0.18)
++project(cgproxy VERSION 0.19)
+ 
+ include(GNUInstallDirs)
+ 
+@@ -32,8 +32,8 @@ configure_file(cgproxyd.cmake cgproxyd)
+ configure_file(cgproxy.service.cmake cgproxy.service)
+ 
+ # instal scripts and other things
+-install(PROGRAMS ${CMAKE_BINARY_DIR}/cgproxyd TYPE BIN)
+-install(PROGRAMS ${CMAKE_BINARY_DIR}/cgnoproxy TYPE BIN)
++install(PROGRAMS ${CMAKE_BINARY_DIR}/cgproxyd DESTINATION ${CMAKE_INSTALL_FULL_BINDIR})
++install(PROGRAMS ${CMAKE_BINARY_DIR}/cgnoproxy DESTINATION ${CMAKE_INSTALL_FULL_BINDIR})
+ install(PROGRAMS cgroup-tproxy.sh DESTINATION ${CMAKE_INSTALL_FULL_DATADIR}/cgproxy/scripts)
+ install(FILES ${CMAKE_BINARY_DIR}/cgproxy.service DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/systemd/system)
+ install(FILES config.json DESTINATION ${CMAKE_INSTALL_FULL_SYSCONFDIR}/cgproxy)
+@@ -46,4 +46,4 @@ add_custom_command(OUTPUT ${man_gz}
+     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/man
+ )
+ add_custom_target(man ALL DEPENDS ${man_gz})
+-install(FILES ${man_gz} DESTINATION ${CMAKE_INSTALL_MANDIR}/man1/)
++install(FILES ${man_gz} DESTINATION ${CMAKE_INSTALL_FULL_MANDIR}/man1/)
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 7fba76c..cc69880 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -17,7 +17,7 @@ endif()
+ add_executable(main main.cpp common.cpp config.cpp cgroup_attach.cpp socket_client.cpp socket_server.cpp)
+ target_link_libraries(main PRIVATE nlohmann_json::nlohmann_json ${DL_LIB} ${EXECSNOOP_LIB})
+ set_target_properties(main PROPERTIES OUTPUT_NAME cgproxy)
+-install(TARGETS main RUNTIME)
++install(TARGETS main DESTINATION ${CMAKE_INSTALL_FULL_BINDIR})
+ 
+ if (build_static)
+     target_link_libraries(main PRIVATE -static -Wl,--whole-archive -lpthread -Wl,--no-whole-archive)
+-- 
+2.30.2
+

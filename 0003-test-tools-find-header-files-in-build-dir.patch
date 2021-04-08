@@ -1,0 +1,36 @@
+From fd30b0025f1d2288e846b33397f19317a253aea0 Mon Sep 17 00:00:00 2001
+From: sixg0000d <sixg0000d@gmail.com>
+Date: Thu, 24 Sep 2020 01:07:37 +0800
+Subject: [PATCH 3/5] test, tools: find header files in build dir
+
+---
+ test/CMakeLists.txt  | 1 +
+ tools/CMakeLists.txt | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index e2882d6..5802483 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -1,5 +1,6 @@
+ include_directories(${PROJECT_SOURCE_DIR})
+ include_directories(${PROJECT_SOURCE_DIR}/src)
++include_directories(${PROJECT_BINARY_DIR}/src)
+ 
+ find_package(nlohmann_json REQUIRED)
+ add_executable(client_test socket_client_test.cpp
+diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
+index 60be96a..9570195 100644
+--- a/tools/CMakeLists.txt
++++ b/tools/CMakeLists.txt
+@@ -1,5 +1,6 @@
+ include_directories(${PROJECT_SOURCE_DIR})
+ include_directories(${PROJECT_SOURCE_DIR}/src)
++include_directories(${PROJECT_BINARY_DIR}/src)
+ 
+ add_executable(cgattach cgattach.cpp ../src/cgroup_attach.cpp ../src/common.cpp)
+ install(TARGETS cgattach  DESTINATION ${CMAKE_INSTALL_FULL_BINDIR} PERMISSIONS ${basic_permission})
+\ No newline at end of file
+-- 
+2.30.2
+

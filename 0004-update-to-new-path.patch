@@ -1,0 +1,25 @@
+From 7f81a7f2bdf3ec509bee65b9bb13b6df2b834bfe Mon Sep 17 00:00:00 2001
+From: Kslr <hi@kslr.org>
+Date: Fri, 20 Nov 2020 06:44:43 +0800
+Subject: [PATCH 4/5] update to new path
+
+---
+ readme.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/readme.md b/readme.md
+index ad56083..ba41b6d 100644
+--- a/readme.md
++++ b/readme.md
+@@ -214,7 +214,7 @@ sudo systemctl restart cgproxy.service
+ - v2ray TPROXY need root or special permission, use [service](/v2ray_config/v2ray.service) or
+   
+   ```bash
+-  sudo setcap "cap_net_admin,cap_net_bind_service=ep" /usr/lib/v2ray/v2ray
++  sudo setcap "cap_net_admin,cap_net_bind_service=ep" /usr/bin/v2ray
+   ```
+ 
+ - Why not outbound mark solution, because in v2ray [when `"localhost"` is used, out-going DNS traffic is not controlled by V2Ray](https://www.v2fly.org/config/dns.html#dnsobject), so no mark at all, that's pity.
+-- 
+2.30.2
+
