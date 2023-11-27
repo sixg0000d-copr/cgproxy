@@ -1,0 +1,903 @@
+From d7990c0c2f1a1add5f863d35c670ec6aa720f1d3 Mon Sep 17 00:00:00 2001
+From: cubercsl <2014cais01@gmail.com>
+Date: Sat, 21 Jan 2023 14:19:03 +0800
+Subject: [PATCH 1/3] feat: add nftables support
+
+---
+ CMakeLists.txt         |   5 +-
+ cgroup-tproxy.sh       | 274 -----------------------------------------
+ cgroup-tproxy.sh.cmake | 132 ++++++++++++++++++++
+ config.json            |   3 +-
+ iptables.sh            | 148 ++++++++++++++++++++++
+ nftables.sh            | 104 ++++++++++++++++
+ readme.md              |   2 +
+ src/config.cpp         |   8 +-
+ src/config.h           |   3 +-
+ 9 files changed, 400 insertions(+), 279 deletions(-)
+ delete mode 100755 cgroup-tproxy.sh
+ create mode 100755 cgroup-tproxy.sh.cmake
+ create mode 100644 iptables.sh
+ create mode 100644 nftables.sh
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a11a4fc..aa20d43 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -30,11 +30,14 @@ endif()
+ configure_file(cgnoproxy.cmake cgnoproxy)
+ configure_file(cgproxyd.cmake cgproxyd)
+ configure_file(cgproxy.service.cmake cgproxy.service)
++configure_file(cgroup-tproxy.sh.cmake cgroup-tproxy.sh @ONLY)
+ 
+ # instal scripts and other things
+ install(PROGRAMS ${CMAKE_BINARY_DIR}/cgproxyd DESTINATION ${CMAKE_INSTALL_FULL_BINDIR})
+ install(PROGRAMS ${CMAKE_BINARY_DIR}/cgnoproxy DESTINATION ${CMAKE_INSTALL_FULL_BINDIR})
+-install(PROGRAMS cgroup-tproxy.sh DESTINATION ${CMAKE_INSTALL_FULL_DATADIR}/cgproxy/scripts)
++install(PROGRAMS ${CMAKE_BINARY_DIR}/cgroup-tproxy.sh DESTINATION ${CMAKE_INSTALL_FULL_DATADIR}/cgproxy/scripts)
++install(FILES iptables.sh DESTINATION ${CMAKE_INSTALL_FULL_DATADIR}/cgproxy/scripts)
++install(FILES nftables.sh DESTINATION ${CMAKE_INSTALL_FULL_DATADIR}/cgproxy/scripts)
+ install(FILES ${CMAKE_BINARY_DIR}/cgproxy.service DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/systemd/system)
+ install(FILES config.json DESTINATION ${CMAKE_INSTALL_FULL_SYSCONFDIR}/cgproxy)
+ install(FILES readme.md DESTINATION ${CMAKE_INSTALL_FULL_DOCDIR})
+diff --git a/cgroup-tproxy.sh b/cgroup-tproxy.sh
+deleted file mode 100755
+index 5d3265f..0000000
+--- a/cgroup-tproxy.sh
++++ /dev/null
+@@ -1,274 +0,0 @@
+-#!/bin/bash
+-### This script will proxy/noproxy anything running in specific cgroup
+-### need cgroup2 support, and iptables cgroup2 path match support
+-### 
+-### script usage:
+-###     cgroup-tproxy.sh [--help|--config|stop]
+-### options:
+-###     --config=FILE   load config from file
+-###            --help   show help info
+-###              stop   clean then stop. Variables may change when stopping, which should be avoid
+-###                     so always stop first in the last context before start new context
+-###
+-### available variables with default value:
+-###     cgroup_noproxy="/noproxy.slice" 
+-###     cgroup_proxy="/proxy.slice" 
+-###     port=12345
+-###     enable_dns=true
+-###     enable_udp=true
+-###     enable_tcp=true
+-###     enable_ipv4=true
+-###     enable_ipv6=true
+-###     enable_gateway=false
+-###     table=10007
+-###     fwmark=0x9973
+-###     cgroup_mount_point=$(findmnt -t cgroup2 -n -o TARGET | head -n 1)
+-###
+-### semicolon to seperate multi cgroup:
+-###     cgroup_noproxy="/noproxy1.slice:/noproxy2.slice"
+-###     cgroup_proxy="/proxy1.slice:/proxy2.slice"
+-
+-print_help(){
+-    sed -rn 's/^### ?//;T;p' "$0"
+-}
+-
+-## check root
+-[ ! $(id -u) -eq 0 ] && { >&2 echo "iptables: need root to modify iptables";exit -1; }
+-
+-## any process in this cgroup will be proxied
+-if [ -z ${cgroup_proxy+x} ]; then  
+-    cgroup_proxy="/proxy.slice"
+-else
+-    IFS=':' read -r -a cgroup_proxy     <<< "$cgroup_proxy"
+-fi
+-
+-## any process in this cgroup will not be proxied
+-if [ -z ${cgroup_noproxy+x} ]; then  
+-    cgroup_noproxy="/noproxy.slice"
+-else
+-    IFS=':' read -r -a cgroup_noproxy   <<< "$cgroup_noproxy"
+-fi
+-
+-## tproxy listening port
+-[ -z ${port+x} ] && port=12345
+-
+-## controll options
+-[ -z ${enable_dns+x} ]  && enable_dns=true
+-[ -z ${enable_udp+x} ]  && enable_udp=true
+-[ -z ${enable_tcp+x} ]  && enable_tcp=true
+-[ -z ${enable_ipv4+x} ] && enable_ipv4=true
+-[ -z ${enable_ipv6+x} ] && enable_ipv6=true
+-[ -z ${enable_gateway+x} ] && enable_gateway=false
+-
+-## mark/route things
+-[ -z ${table+x} ]           && table=10007
+-[ -z ${fwmark+x} ]          && fwmark=0x9973
+-[ -z ${table_reroute+x} ]   && table_reroute=$table
+-[ -z ${table_tproxy+x} ]    && table_tproxy=$table
+-[ -z ${fwmark_reroute+x} ]  && fwmark_reroute=$fwmark
+-[ -z ${fwmark_tproxy+x} ]   && fwmark_tproxy=$fwmark
+-
+-## cgroup mount point things
+-[ -z ${cgroup_mount_point+x} ] && cgroup_mount_point=$(findmnt -t cgroup2 -n -o TARGET | head -n 1)
+-
+-
+-stop(){
+-    iptables -w 60 -t mangle -L TPROXY_ENT &> /dev/null || return
+-    echo "iptables: cleaning tproxy iptables"
+-
+-    iptables -w 60 -t mangle -D PREROUTING -j TPROXY_PRE
+-    iptables -w 60 -t mangle -D OUTPUT -j TPROXY_OUT
+-
+-    iptables -w 60 -t mangle -F TPROXY_PRE
+-    iptables -w 60 -t mangle -F TPROXY_ENT
+-    iptables -w 60 -t mangle -F TPROXY_OUT
+-    iptables -w 60 -t mangle -F TPROXY_MARK
+-
+-    iptables -w 60 -t mangle -X TPROXY_PRE
+-    iptables -w 60 -t mangle -X TPROXY_ENT
+-    iptables -w 60 -t mangle -X TPROXY_OUT
+-    iptables -w 60 -t mangle -X TPROXY_MARK
+-
+-    ip rule delete fwmark $fwmark_tproxy lookup $table_tproxy
+-    ip rule delete fwmark $fwmark_reroute lookup $table_reroute &> /dev/null
+-    ip route flush table $table_tproxy
+-    ip route flush table $table_reroute &> /dev/null
+-
+-    ip6tables -w 60 -t mangle -D PREROUTING -j TPROXY_PRE
+-    ip6tables -w 60 -t mangle -D OUTPUT -j TPROXY_OUT
+-
+-    ip6tables -w 60 -t mangle -F TPROXY_PRE
+-    ip6tables -w 60 -t mangle -F TPROXY_OUT
+-    ip6tables -w 60 -t mangle -F TPROXY_ENT
+-    ip6tables -w 60 -t mangle -F TPROXY_MARK
+-
+-    ip6tables -w 60 -t mangle -X TPROXY_PRE
+-    ip6tables -w 60 -t mangle -X TPROXY_OUT
+-    ip6tables -w 60 -t mangle -X TPROXY_ENT
+-    ip6tables -w 60 -t mangle -X TPROXY_MARK
+-
+-    ip -6 rule delete fwmark $fwmark_tproxy lookup $table_tproxy
+-    ip -6 rule delete fwmark $fwmark_reroute lookup $table_reroute &> /dev/null
+-    ip -6 route flush table $table_tproxy
+-    ip -6 route flush table $table_reroute &> /dev/null
+-
+-    ## may not exist, just ignore, and tracking their existence is not reliable
+-    iptables -w 60 -t nat -D POSTROUTING -m owner ! --socket-exists -j MASQUERADE &> /dev/null
+-    ip6tables -w 60 -t nat -D POSTROUTING -m owner ! --socket-exists -s fc00::/7 -j MASQUERADE &> /dev/null
+-
+-    ## unmount cgroup2
+-    [ "$(findmnt -M $cgroup_mount_point -n -o FSTYPE)" = "cgroup2" ] && umount $cgroup_mount_point
+-}
+-
+-## parse parameter
+-for i in "$@"
+-do
+-case $i in
+-    stop)
+-        stop
+-        exit 0
+-        ;;
+-    --config=*)
+-        config=${i#*=}
+-        source $config
+-        ;;
+-    --help)
+-        print_help
+-        exit 0
+-        ;;
+-    *)
+-        print_help
+-        exit 0
+-        ;;
+-esac
+-done
+-
+-
+-## check cgroup_mount_point, create and mount if necessary
+-[ -z $cgroup_mount_point ] && { >&2 echo "iptables: no cgroup2 mount point available"; exit -1; }
+-[ ! -d $cgroup_mount_point ] && mkdir -p $cgroup_mount_point
+-[ "$(findmnt -M $cgroup_mount_point -n -o FSTYPE)" != "cgroup2" ] && mount -t cgroup2 none $cgroup_mount_point
+-[ "$(findmnt -M $cgroup_mount_point -n -o FSTYPE)" != "cgroup2" ] && { >&2 echo "iptables: mount $cgroup_mount_point failed"; exit -1; }
+-
+-## only create the first one in arrary
+-test -d $cgroup_mount_point$cgroup_proxy    || mkdir $cgroup_mount_point$cgroup_proxy   || exit -1; 
+-test -d $cgroup_mount_point$cgroup_noproxy  || mkdir $cgroup_mount_point$cgroup_noproxy || exit -1; 
+-
+-## filter cgroup that not exist
+-_cgroup_noproxy=()
+-for cg in ${cgroup_noproxy[@]}; do
+-    test -d $cgroup_mount_point$cg && _cgroup_noproxy+=($cg) || { >&2 echo "iptables: $cg not exist, ignore";}
+-done
+-unset cgroup_noproxy && cgroup_noproxy=${_cgroup_noproxy[@]}
+-
+-## filter cgroup that not exist
+-_cgroup_proxy=()
+-for cg in ${cgroup_proxy[@]}; do
+-    test -d $cgroup_mount_point$cg && _cgroup_proxy+=($cg) || { >&2 echo "iptables: $cg not exist, ignore";}
+-done
+-unset cgroup_proxy && cgroup_proxy=${_cgroup_proxy[@]}
+-
+-
+-## ipv4 #########################################################################
+-echo "iptables: applying tproxy iptables"
+-## mangle prerouting
+-ip rule add fwmark $fwmark_tproxy table $table_tproxy
+-ip route add local default dev lo table $table_tproxy
+-# core
+-iptables -w 60 -t mangle -N TPROXY_ENT
+-iptables -w 60 -t mangle -A TPROXY_ENT -m socket -j MARK --set-mark $fwmark_tproxy
+-iptables -w 60 -t mangle -A TPROXY_ENT -m socket -j ACCEPT
+-iptables -w 60 -t mangle -A TPROXY_ENT -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port $port --tproxy-mark $fwmark_tproxy
+-iptables -w 60 -t mangle -A TPROXY_ENT -p udp -j TPROXY --on-ip 127.0.0.1 --on-port $port --tproxy-mark $fwmark_tproxy
+-# filter
+-iptables -w 60 -t mangle -N TPROXY_PRE
+-iptables -w 60 -t mangle -A TPROXY_PRE -m addrtype --dst-type LOCAL -j RETURN
+-iptables -w 60 -t mangle -A TPROXY_PRE -m addrtype ! --dst-type UNICAST -j RETURN
+-$enable_gateway  || iptables -w 60 -t mangle -A TPROXY_PRE -m addrtype ! --src-type LOCAL -j RETURN
+-$enable_dns && iptables -w 60 -t mangle -A TPROXY_PRE -p udp --dport 53 -j TPROXY_ENT
+-$enable_udp && iptables -w 60 -t mangle -A TPROXY_PRE -p udp -j TPROXY_ENT
+-$enable_tcp && iptables -w 60 -t mangle -A TPROXY_PRE -p tcp -j TPROXY_ENT
+-# hook
+-iptables -w 60 -t mangle -A PREROUTING -j TPROXY_PRE
+-
+-## mangle output
+-if [ $fwmark_reroute != $fwmark_tproxy ]; then
+-ip rule add fwmark $fwmark_reroute table $table_reroute
+-ip route add local default dev lo table $table_reroute
+-fi
+-# filter
+-iptables -w 60 -t mangle -N TPROXY_MARK
+-iptables -w 60 -t mangle -A TPROXY_MARK -m addrtype ! --dst-type UNICAST -j RETURN
+-$enable_dns && iptables -w 60 -t mangle -A TPROXY_MARK -p udp --dport 53 -j MARK --set-mark $fwmark_reroute
+-$enable_udp && iptables -w 60 -t mangle -A TPROXY_MARK -p udp -j MARK --set-mark $fwmark_reroute
+-$enable_tcp && iptables -w 60 -t mangle -A TPROXY_MARK -p tcp -j MARK --set-mark $fwmark_reroute
+-# cgroup
+-iptables -w 60 -t mangle -N TPROXY_OUT
+-iptables -w 60 -t mangle -A TPROXY_OUT -m conntrack --ctdir REPLY -j RETURN
+-for cg in ${cgroup_noproxy[@]}; do
+-iptables -w 60 -t mangle -A TPROXY_OUT -m cgroup --path $cg -j RETURN
+-done
+-for cg in ${cgroup_proxy[@]}; do
+-iptables -w 60 -t mangle -A TPROXY_OUT -m cgroup --path $cg -j TPROXY_MARK
+-done
+-# hook
+-$enable_ipv4 && iptables -w 60 -t mangle -A OUTPUT -j TPROXY_OUT
+-
+-## ipv6 #########################################################################
+-## mangle prerouting
+-ip -6 rule add fwmark $fwmark_tproxy table $table_tproxy
+-ip -6 route add local default dev lo table $table_tproxy
+-# core
+-ip6tables -w 60 -t mangle -N TPROXY_ENT
+-ip6tables -w 60 -t mangle -A TPROXY_ENT -m socket -j MARK --set-mark $fwmark_tproxy
+-ip6tables -w 60 -t mangle -A TPROXY_ENT -m socket -j ACCEPT
+-ip6tables -w 60 -t mangle -A TPROXY_ENT -p tcp -j TPROXY --on-ip ::1 --on-port $port --tproxy-mark $fwmark_tproxy
+-ip6tables -w 60 -t mangle -A TPROXY_ENT -p udp -j TPROXY --on-ip ::1 --on-port $port --tproxy-mark $fwmark_tproxy
+-# filter
+-ip6tables -w 60 -t mangle -N TPROXY_PRE
+-ip6tables -w 60 -t mangle -A TPROXY_PRE -m addrtype --dst-type LOCAL -j RETURN
+-ip6tables -w 60 -t mangle -A TPROXY_PRE -m addrtype ! --dst-type UNICAST -j RETURN
+-$enable_gateway  || ip6tables -w 60 -t mangle -A TPROXY_PRE -m addrtype ! --src-type LOCAL -j RETURN
+-$enable_dns && ip6tables -w 60 -t mangle -A TPROXY_PRE -p udp --dport 53 -j TPROXY_ENT
+-$enable_udp && ip6tables -w 60 -t mangle -A TPROXY_PRE -p udp -j TPROXY_ENT
+-$enable_tcp && ip6tables -w 60 -t mangle -A TPROXY_PRE -p tcp -j TPROXY_ENT
+-# hook
+-ip6tables -w 60 -t mangle -A PREROUTING -j TPROXY_PRE
+-
+-## mangle output
+-if [ $fwmark_reroute != $fwmark_tproxy ]; then
+-ip -6 rule add fwmark $fwmark_reroute table $table_reroute
+-ip -6 route add local default dev lo table $table_reroute
+-fi
+-# filter
+-ip6tables -w 60 -t mangle -N TPROXY_MARK
+-ip6tables -w 60 -t mangle -A TPROXY_MARK -m addrtype ! --dst-type UNICAST -j RETURN
+-$enable_dns && ip6tables -w 60 -t mangle -A TPROXY_MARK -p udp --dport 53 -j MARK --set-mark $fwmark_reroute
+-$enable_udp && ip6tables -w 60 -t mangle -A TPROXY_MARK -p udp -j MARK --set-mark $fwmark_reroute
+-$enable_tcp && ip6tables -w 60 -t mangle -A TPROXY_MARK -p tcp -j MARK --set-mark $fwmark_reroute
+-# cgroup
+-ip6tables -w 60 -t mangle -N TPROXY_OUT
+-ip6tables -w 60 -t mangle -A TPROXY_OUT -m conntrack --ctdir REPLY -j RETURN
+-for cg in ${cgroup_noproxy[@]}; do
+-ip6tables -w 60 -t mangle -A TPROXY_OUT -m cgroup --path $cg -j RETURN
+-done
+-for cg in ${cgroup_proxy[@]}; do
+-ip6tables -w 60 -t mangle -A TPROXY_OUT -m cgroup --path $cg -j TPROXY_MARK
+-done
+-# hook
+-$enable_ipv6 && ip6tables -w 60 -t mangle -A OUTPUT -j TPROXY_OUT
+-
+-## forward #######################################################################
+-if $enable_gateway; then
+-    iptables  -t nat -A POSTROUTING -m owner ! --socket-exists -j MASQUERADE
+-    ip6tables -w 60 -t nat -A POSTROUTING -m owner ! --socket-exists -s fc00::/7 -j MASQUERADE # only masquerade ipv6 private address
+-    sysctl -w net.ipv4.ip_forward=1
+-    sysctl -w net.ipv6.conf.all.forwarding=1
+-    echo "iptables: gateway enabled"
+-fi
+-
+-## message for user
+-cat << DOC
+-iptables: noproxy cgroup: ${cgroup_noproxy[@]}
+-iptables: proxied cgroup: ${cgroup_proxy[@]}
+-DOC
+diff --git a/cgroup-tproxy.sh.cmake b/cgroup-tproxy.sh.cmake
+new file mode 100755
+index 0000000..c2a27a6
+--- /dev/null
++++ b/cgroup-tproxy.sh.cmake
+@@ -0,0 +1,132 @@
++#!/bin/bash
++### This script will proxy/noproxy anything running in specific cgroup
++### need cgroup2 support, and iptables cgroup2 path match support
++### 
++### script usage:
++###     cgroup-tproxy.sh [--help|--config|stop]
++### options:
++###     --config=FILE   load config from file
++###            --help   show help info
++###              stop   clean then stop. Variables may change when stopping, which should be avoid
++###                     so always stop first in the last context before start new context
++###
++### available variables with default value:
++###     cgroup_noproxy="/noproxy.slice" 
++###     cgroup_proxy="/proxy.slice" 
++###     port=12345
++###     enable_dns=true
++###     enable_udp=true
++###     enable_tcp=true
++###     enable_ipv4=true
++###     enable_ipv6=true
++###     enable_gateway=false
++###     table=10007
++###     fwmark=0x9973
++###     cgroup_mount_point=$(findmnt -t cgroup2 -n -o TARGET | head -n 1)
++###
++### semicolon to seperate multi cgroup:
++###     cgroup_noproxy="/noproxy1.slice:/noproxy2.slice"
++###     cgroup_proxy="/proxy1.slice:/proxy2.slice"
++
++print_help(){
++    sed -rn 's/^### ?//;T;p' "$0"
++}
++
++## check root
++[ ! $(id -u) -eq 0 ] && { >&2 echo "iptables/nftables: need root to modify iptables/nftables";exit -1; }
++
++## any process in this cgroup will be proxied
++if [ -z ${cgroup_proxy+x} ]; then  
++    cgroup_proxy="/proxy.slice"
++else
++    IFS=':' read -r -a cgroup_proxy     <<< "$cgroup_proxy"
++fi
++
++## any process in this cgroup will not be proxied
++if [ -z ${cgroup_noproxy+x} ]; then  
++    cgroup_noproxy="/noproxy.slice"
++else
++    IFS=':' read -r -a cgroup_noproxy   <<< "$cgroup_noproxy"
++fi
++
++## tproxy listening port
++[ -z ${port+x} ] && port=12345
++
++## controll options
++[ -z ${enable_dns+x} ]  && enable_dns=true
++[ -z ${enable_udp+x} ]  && enable_udp=true
++[ -z ${enable_tcp+x} ]  && enable_tcp=true
++[ -z ${enable_ipv4+x} ] && enable_ipv4=true
++[ -z ${enable_ipv6+x} ] && enable_ipv6=true
++[ -z ${enable_gateway+x} ] && enable_gateway=false
++
++## mark/route things
++[ -z ${table+x} ]           && table=10007
++[ -z ${fwmark+x} ]          && fwmark=0x9973
++[ -z ${table_reroute+x} ]   && table_reroute=$table
++[ -z ${table_tproxy+x} ]    && table_tproxy=$table
++[ -z ${fwmark_reroute+x} ]  && fwmark_reroute=$fwmark
++[ -z ${fwmark_tproxy+x} ]   && fwmark_tproxy=$fwmark
++[ -z ${enable_nftables+x} ] && enable_nftables=false
++
++## cgroup mount point things
++[ -z ${cgroup_mount_point+x} ] && cgroup_mount_point=$(findmnt -t cgroup2 -n -o TARGET | head -n 1)
++
++stop=false
++## parse parameter
++for i in "$@"
++do
++case $i in
++    stop)
++        stop=true
++        ;;
++    --config=*)
++        config=${i#*=}
++        source $config
++        ;;
++    --help)
++        print_help
++        exit 0
++        ;;
++    *)
++        print_help
++        exit 0
++        ;;
++esac
++done
++
++$enable_nftables && iptables=nftables || iptables=iptables
++source @CMAKE_INSTALL_FULL_DATADIR@/cgproxy/scripts/$iptables.sh
++
++$stop && { stop;exit 0; }
++## check cgroup_mount_point, create and mount if necessary
++[ -z $cgroup_mount_point ] && { >&2 echo "$iptables: no cgroup2 mount point available"; exit -1; }
++[ ! -d $cgroup_mount_point ] && mkdir -p $cgroup_mount_point
++[ "$(findmnt -M $cgroup_mount_point -n -o FSTYPE)" != "cgroup2" ] && mount -t cgroup2 none $cgroup_mount_point
++[ "$(findmnt -M $cgroup_mount_point -n -o FSTYPE)" != "cgroup2" ] && { >&2 echo "$iptables: mount $cgroup_mount_point failed"; exit -1; }
++
++## only create the first one in arrary
++test -d $cgroup_mount_point$cgroup_proxy    || mkdir $cgroup_mount_point$cgroup_proxy   || exit -1; 
++test -d $cgroup_mount_point$cgroup_noproxy  || mkdir $cgroup_mount_point$cgroup_noproxy || exit -1; 
++
++## filter cgroup that not exist
++_cgroup_noproxy=()
++for cg in ${cgroup_noproxy[@]}; do
++    test -d $cgroup_mount_point$cg && _cgroup_noproxy+=($cg) || { >&2 echo "$iptables: $cg not exist, ignore";}
++done
++unset cgroup_noproxy && cgroup_noproxy=${_cgroup_noproxy[@]}
++
++## filter cgroup that not exist
++_cgroup_proxy=()
++for cg in ${cgroup_proxy[@]}; do
++    test -d $cgroup_mount_point$cg && _cgroup_proxy+=($cg) || { >&2 echo "$iptables: $cg not exist, ignore";}
++done
++unset cgroup_proxy && cgroup_proxy=${_cgroup_proxy[@]}
++
++start
++
++## message for user
++cat << DOC
++$iptables: noproxy cgroup: ${cgroup_noproxy[@]}
++$iptables: proxied cgroup: ${cgroup_proxy[@]}
++DOC
+diff --git a/config.json b/config.json
+index 91f9b0e..d8c0cfb 100644
+--- a/config.json
++++ b/config.json
+@@ -13,5 +13,6 @@
+     "enable_ipv4": true,
+     "enable_ipv6": true,
+     "table": 10007,
+-    "fwmark": 39283
++    "fwmark": 39283,
++    "enable_nftables": false
+ }
+diff --git a/iptables.sh b/iptables.sh
+new file mode 100644
+index 0000000..bc4bd63
+--- /dev/null
++++ b/iptables.sh
+@@ -0,0 +1,148 @@
++stop(){
++    iptables -w 60 -t mangle -L TPROXY_ENT &> /dev/null || return
++    echo "iptables: cleaning tproxy iptables"
++
++    iptables -w 60 -t mangle -D PREROUTING -j TPROXY_PRE
++    iptables -w 60 -t mangle -D OUTPUT -j TPROXY_OUT
++
++    iptables -w 60 -t mangle -F TPROXY_PRE
++    iptables -w 60 -t mangle -F TPROXY_ENT
++    iptables -w 60 -t mangle -F TPROXY_OUT
++    iptables -w 60 -t mangle -F TPROXY_MARK
++
++    iptables -w 60 -t mangle -X TPROXY_PRE
++    iptables -w 60 -t mangle -X TPROXY_ENT
++    iptables -w 60 -t mangle -X TPROXY_OUT
++    iptables -w 60 -t mangle -X TPROXY_MARK
++
++    ip rule delete fwmark $fwmark_tproxy lookup $table_tproxy
++    ip rule delete fwmark $fwmark_reroute lookup $table_reroute &> /dev/null
++    ip route flush table $table_tproxy
++    ip route flush table $table_reroute &> /dev/null
++
++    ip6tables -w 60 -t mangle -D PREROUTING -j TPROXY_PRE
++    ip6tables -w 60 -t mangle -D OUTPUT -j TPROXY_OUT
++
++    ip6tables -w 60 -t mangle -F TPROXY_PRE
++    ip6tables -w 60 -t mangle -F TPROXY_OUT
++    ip6tables -w 60 -t mangle -F TPROXY_ENT
++    ip6tables -w 60 -t mangle -F TPROXY_MARK
++
++    ip6tables -w 60 -t mangle -X TPROXY_PRE
++    ip6tables -w 60 -t mangle -X TPROXY_OUT
++    ip6tables -w 60 -t mangle -X TPROXY_ENT
++    ip6tables -w 60 -t mangle -X TPROXY_MARK
++
++    ip -6 rule delete fwmark $fwmark_tproxy lookup $table_tproxy
++    ip -6 rule delete fwmark $fwmark_reroute lookup $table_reroute &> /dev/null
++    ip -6 route flush table $table_tproxy
++    ip -6 route flush table $table_reroute &> /dev/null
++
++    ## may not exist, just ignore, and tracking their existence is not reliable
++    iptables -w 60 -t nat -D POSTROUTING -m owner ! --socket-exists -j MASQUERADE &> /dev/null
++    ip6tables -w 60 -t nat -D POSTROUTING -m owner ! --socket-exists -s fc00::/7 -j MASQUERADE &> /dev/null
++
++    ## unmount cgroup2
++    [ "$(findmnt -M $cgroup_mount_point -n -o FSTYPE)" = "cgroup2" ] && umount $cgroup_mount_point
++}
++
++
++start(){
++    ## ipv4 #########################################################################
++    echo "iptables: applying tproxy iptables"
++    ## mangle prerouting
++    ip rule add fwmark $fwmark_tproxy table $table_tproxy
++    ip route add local default dev lo table $table_tproxy
++    # core
++    iptables -w 60 -t mangle -N TPROXY_ENT
++    iptables -w 60 -t mangle -A TPROXY_ENT -m socket -j MARK --set-mark $fwmark_tproxy
++    iptables -w 60 -t mangle -A TPROXY_ENT -m socket -j ACCEPT
++    iptables -w 60 -t mangle -A TPROXY_ENT -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port $port --tproxy-mark $fwmark_tproxy
++    iptables -w 60 -t mangle -A TPROXY_ENT -p udp -j TPROXY --on-ip 127.0.0.1 --on-port $port --tproxy-mark $fwmark_tproxy
++    # filter
++    iptables -w 60 -t mangle -N TPROXY_PRE
++    iptables -w 60 -t mangle -A TPROXY_PRE -m addrtype --dst-type LOCAL -j RETURN
++    iptables -w 60 -t mangle -A TPROXY_PRE -m addrtype ! --dst-type UNICAST -j RETURN
++    $enable_gateway  || iptables -w 60 -t mangle -A TPROXY_PRE -m addrtype ! --src-type LOCAL -j RETURN
++    $enable_dns && iptables -w 60 -t mangle -A TPROXY_PRE -p udp --dport 53 -j TPROXY_ENT
++    $enable_udp && iptables -w 60 -t mangle -A TPROXY_PRE -p udp -j TPROXY_ENT
++    $enable_tcp && iptables -w 60 -t mangle -A TPROXY_PRE -p tcp -j TPROXY_ENT
++    # hook
++    iptables -w 60 -t mangle -A PREROUTING -j TPROXY_PRE
++
++    ## mangle output
++    if [ $fwmark_reroute != $fwmark_tproxy ]; then
++    ip rule add fwmark $fwmark_reroute table $table_reroute
++    ip route add local default dev lo table $table_reroute
++    fi
++    # filter
++    iptables -w 60 -t mangle -N TPROXY_MARK
++    iptables -w 60 -t mangle -A TPROXY_MARK -m addrtype ! --dst-type UNICAST -j RETURN
++    $enable_dns && iptables -w 60 -t mangle -A TPROXY_MARK -p udp --dport 53 -j MARK --set-mark $fwmark_reroute
++    $enable_udp && iptables -w 60 -t mangle -A TPROXY_MARK -p udp -j MARK --set-mark $fwmark_reroute
++    $enable_tcp && iptables -w 60 -t mangle -A TPROXY_MARK -p tcp -j MARK --set-mark $fwmark_reroute
++    # cgroup
++    iptables -w 60 -t mangle -N TPROXY_OUT
++    iptables -w 60 -t mangle -A TPROXY_OUT -m conntrack --ctdir REPLY -j RETURN
++    for cg in ${cgroup_noproxy[@]}; do
++    iptables -w 60 -t mangle -A TPROXY_OUT -m cgroup --path $cg -j RETURN
++    done
++    for cg in ${cgroup_proxy[@]}; do
++    iptables -w 60 -t mangle -A TPROXY_OUT -m cgroup --path $cg -j TPROXY_MARK
++    done
++    # hook
++    $enable_ipv4 && iptables -w 60 -t mangle -A OUTPUT -j TPROXY_OUT
++
++    ## ipv6 #########################################################################
++    ## mangle prerouting
++    ip -6 rule add fwmark $fwmark_tproxy table $table_tproxy
++    ip -6 route add local default dev lo table $table_tproxy
++    # core
++    ip6tables -w 60 -t mangle -N TPROXY_ENT
++    ip6tables -w 60 -t mangle -A TPROXY_ENT -m socket -j MARK --set-mark $fwmark_tproxy
++    ip6tables -w 60 -t mangle -A TPROXY_ENT -m socket -j ACCEPT
++    ip6tables -w 60 -t mangle -A TPROXY_ENT -p tcp -j TPROXY --on-ip ::1 --on-port $port --tproxy-mark $fwmark_tproxy
++    ip6tables -w 60 -t mangle -A TPROXY_ENT -p udp -j TPROXY --on-ip ::1 --on-port $port --tproxy-mark $fwmark_tproxy
++    # filter
++    ip6tables -w 60 -t mangle -N TPROXY_PRE
++    ip6tables -w 60 -t mangle -A TPROXY_PRE -m addrtype --dst-type LOCAL -j RETURN
++    ip6tables -w 60 -t mangle -A TPROXY_PRE -m addrtype ! --dst-type UNICAST -j RETURN
++    $enable_gateway  || ip6tables -w 60 -t mangle -A TPROXY_PRE -m addrtype ! --src-type LOCAL -j RETURN
++    $enable_dns && ip6tables -w 60 -t mangle -A TPROXY_PRE -p udp --dport 53 -j TPROXY_ENT
++    $enable_udp && ip6tables -w 60 -t mangle -A TPROXY_PRE -p udp -j TPROXY_ENT
++    $enable_tcp && ip6tables -w 60 -t mangle -A TPROXY_PRE -p tcp -j TPROXY_ENT
++    # hook
++    ip6tables -w 60 -t mangle -A PREROUTING -j TPROXY_PRE
++
++    ## mangle output
++    if [ $fwmark_reroute != $fwmark_tproxy ]; then
++    ip -6 rule add fwmark $fwmark_reroute table $table_reroute
++    ip -6 route add local default dev lo table $table_reroute
++    fi
++    # filter
++    ip6tables -w 60 -t mangle -N TPROXY_MARK
++    ip6tables -w 60 -t mangle -A TPROXY_MARK -m addrtype ! --dst-type UNICAST -j RETURN
++    $enable_dns && ip6tables -w 60 -t mangle -A TPROXY_MARK -p udp --dport 53 -j MARK --set-mark $fwmark_reroute
++    $enable_udp && ip6tables -w 60 -t mangle -A TPROXY_MARK -p udp -j MARK --set-mark $fwmark_reroute
++    $enable_tcp && ip6tables -w 60 -t mangle -A TPROXY_MARK -p tcp -j MARK --set-mark $fwmark_reroute
++    # cgroup
++    ip6tables -w 60 -t mangle -N TPROXY_OUT
++    ip6tables -w 60 -t mangle -A TPROXY_OUT -m conntrack --ctdir REPLY -j RETURN
++    for cg in ${cgroup_noproxy[@]}; do
++    ip6tables -w 60 -t mangle -A TPROXY_OUT -m cgroup --path $cg -j RETURN
++    done
++    for cg in ${cgroup_proxy[@]}; do
++    ip6tables -w 60 -t mangle -A TPROXY_OUT -m cgroup --path $cg -j TPROXY_MARK
++    done
++    # hook
++    $enable_ipv6 && ip6tables -w 60 -t mangle -A OUTPUT -j TPROXY_OUT
++
++    ## forward #######################################################################
++    if $enable_gateway; then
++        iptables  -t nat -A POSTROUTING -m owner ! --socket-exists -j MASQUERADE
++        ip6tables -w 60 -t nat -A POSTROUTING -m owner ! --socket-exists -s fc00::/7 -j MASQUERADE # only masquerade ipv6 private address
++        sysctl -w net.ipv4.ip_forward=1
++        sysctl -w net.ipv6.conf.all.forwarding=1
++        echo "iptables: gateway enabled"
++    fi
++}
+diff --git a/nftables.sh b/nftables.sh
+new file mode 100644
+index 0000000..9f09f0c
+--- /dev/null
++++ b/nftables.sh
+@@ -0,0 +1,104 @@
++stop() {
++    nft list table inet cgproxy &> /dev/null || return
++    echo "nftables: cleaning tproxy rules"
++    
++    nft delete table inet cgproxy
++
++    ip rule delete fwmark $fwmark_tproxy lookup $table_tproxy
++    ip rule delete fwmark $fwmark_reroute lookup $table_reroute &> /dev/null
++    ip route flush table $table_tproxy
++    ip route flush table $table_reroute &> /dev/null
++
++    ip -6 rule delete fwmark $fwmark_tproxy lookup $table_tproxy
++    ip -6 rule delete fwmark $fwmark_reroute lookup $table_reroute &> /dev/null
++    ip -6 route flush table $table_tproxy
++    ip -6 route flush table $table_reroute &> /dev/null
++
++    ## unmount cgroup2
++    [ "$(findmnt -M $cgroup_mount_point -n -o FSTYPE)" = "cgroup2" ] && umount $cgroup_mount_point
++}
++
++start() {
++    ## nft ##########################################################################
++    echo "nftables: applying tproxy nft rules"
++
++    local _l4proto=()
++    $enable_tcp && _l4proto+=("tcp")
++    $enable_udp && _l4proto+=("udp")
++    local l4proto=$(IFS=,; echo "${_l4proto[*]}")
++
++    local _nfproto=()
++    $enable_ipv4 && _nfproto+=("ipv4")
++    $enable_ipv6 && _nfproto+=("ipv6")
++    local nfproto=$(IFS=,; echo "${_nfproto[*]}")
++
++    nft -f - <<EOF
++table inet cgproxy {
++
++    chain tproxy_ent {
++        # core
++        socket wildcard 0 mark set $fwmark_tproxy accept
++        meta l4proto { tcp, udp } tproxy to :$port meta mark set $fwmark_tproxy
++    }
++
++    chain tproxy_pre {
++        type filter hook prerouting priority mangle - 5; policy accept;
++        # filter
++        fib daddr type local return
++        fib daddr type != unicast return
++        $($enable_gateway || echo "fib saddr type != local return")
++        $($enable_dns && echo "udp dport 53 jump tproxy_ent")
++        $([ -n "$l4proto" ] && echo "meta l4proto { $l4proto } jump tproxy_ent")
++    }
++
++    chain output {
++        # hook
++        type route hook output priority mangle - 5; policy accept;
++        $([ -n "$nfproto" ] && echo "meta nfproto { $nfproto } jump tproxy_out" )
++    }
++
++    chain tproxy_mark {
++        # filter
++        fib daddr type != unicast return
++        $($enable_dns && echo "udp dport 53 mark set $fwmark_tproxy")
++        $([ -n "$l4proto" ] && echo "meta l4proto { $l4proto } mark set $fwmark_tproxy")
++    }
++
++    chain tproxy_out {
++        # cgroup
++        ct direction reply return
++        $(
++            for cg in ${cgroup_noproxy[@]}; do
++                level=$(echo ${cg#/} | awk -F/ '{print NF}')
++                echo "socket cgroupv2 level $level \"${cg#/}\" return"
++            done
++        )
++        $(
++            for cg in ${cgroup_proxy[@]}; do
++                level=$(echo ${cg#/} | awk -F/ '{print NF}')
++                echo "socket cgroupv2 level $level \"${cg#/}\" jump tproxy_mark"
++            done
++        )
++    }
++}
++EOF
++
++    ## mangle prerouting
++    ip rule add fwmark $fwmark_tproxy table $table_tproxy
++    ip route add local default dev lo table $table_tproxy
++    ip -6 rule add fwmark $fwmark_tproxy table $table_tproxy
++    ip -6 route add local default dev lo table $table_tproxy
++
++    ## mangle output
++    if [ $fwmark_reroute != $fwmark_tproxy ]; then
++    ip rule add fwmark $fwmark_reroute table $table_reroute
++    ip route add local default dev lo table $table_reroute
++    ip -6 rule add fwmark $fwmark_reroute table $table_reroute
++    ip -6 route add local default dev lo table $table_reroute
++    fi
++
++    ## forward #######################################################################
++    if $enable_gateway; then
++        echo "warning: gateway is not supported now"
++    fi
++}
+diff --git a/readme.md b/readme.md
+index 881868b..2d725c9 100644
+--- a/readme.md
++++ b/readme.md
+@@ -156,6 +156,8 @@ Config file: **/etc/cgproxy/config.json**
+ 
+ - **table**, **fwmark** you can specify iptables and route table related parameter in case conflict.
+ 
++- **enable_nftables** you can specify to use nft rules if you are using nftables.
++
+ - options priority
+ 
+   ```
+diff --git a/src/config.cpp b/src/config.cpp
+index 770d900..74284c8 100644
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -36,6 +36,7 @@ void Config::toEnv() {
+   setenv("table", to_str(table).c_str(), 1);
+   setenv("fwmark", to_str(fwmark).c_str(), 1);
+   setenv("mark_newin", to_str(mark_newin).c_str(), 1);
++  setenv("enable_nftables", to_str(enable_nftables).c_str(), 1);
+ }
+ 
+ int Config::saveToFile(const string f) {
+@@ -63,6 +64,7 @@ string Config::toJsonStr() {
+   add2json(table);
+   add2json(fwmark);
+   add2json(mark_newin);
++  add2json(enable_nftables);
+   return j.dump();
+ }
+ 
+@@ -99,6 +101,7 @@ int Config::loadFromJsonStr(const string js) {
+   tryassign(table);
+   tryassign(fwmark);
+   tryassign(mark_newin);
++  tryassign(enable_nftables);
+ 
+   // e.g. v2ray -> /usr/bin/v2ray -> /usr/lib/v2ray/v2ray
+   toRealProgramPath(program_noproxy);
+@@ -118,7 +121,7 @@ bool Config::validateJsonStr(const string js) {
+   json j = json::parse(js);
+   bool status = true;
+   const set<string> boolset = {"enable_gateway", "enable_dns",  "enable_tcp",
+-                               "enable_udp",     "enable_ipv4", "enable_ipv6"};
++                               "enable_udp",     "enable_ipv4", "enable_ipv6", "enable_nftables"};
+   const set<string> allowset = {"program_proxy", "program_noproxy", "comment", "table", "fwmark", "mark_newin"};
+   for (auto &[key, value] : j.items()) {
+     if (key == "cgroup_proxy" || key == "cgroup_noproxy") {
+@@ -150,6 +153,7 @@ void Config::print_summary() {
+   info("noproxy cgroup: %s", join2str(cgroup_noproxy).c_str());
+   info("proxied cgroup: %s", join2str(cgroup_proxy).c_str());
+   info("table: %d, fwmark: %d, mark_newin: %d", table, fwmark, mark_newin);
++  info("interface: %s", enable_nftables ? "nft" : "legacy");
+ }
+ 
+ void Config::toRealProgramPath(vector<string> &v) {
+@@ -167,4 +171,4 @@ void Config::toRealProgramPath(vector<string> &v) {
+ #undef add2json
+ #undef merge
+ 
+-} // namespace CGPROXY::CONFIG
+\ No newline at end of file
++} // namespace CGPROXY::CONFIG
+diff --git a/src/config.h b/src/config.h
+index c1b1396..c92b8dd 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -29,6 +29,7 @@ class Config {
+   int table=10007;
+   int fwmark=0x9973;
+   int mark_newin=0x9967;
++  bool enable_nftables=false;
+ 
+   void toEnv();
+   int saveToFile(const string f);
+@@ -44,4 +45,4 @@ class Config {
+ };
+ 
+ } // namespace CGPROXY::CONFIG
+-#endif
+\ No newline at end of file
++#endif
+
+From 2159f397efc0f0df778739c4679ef9b3c4736a85 Mon Sep 17 00:00:00 2001
+From: cubercsl <2014cais01@gmail.com>
+Date: Sun, 22 Jan 2023 22:03:10 +0800
+Subject: [PATCH 2/3] fix: rename iptables to backend
+
+---
+ cgroup-tproxy.sh.cmake | 16 ++++++++--------
+ 1 file changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/cgroup-tproxy.sh.cmake b/cgroup-tproxy.sh.cmake
+index c2a27a6..05f534b 100755
+--- a/cgroup-tproxy.sh.cmake
++++ b/cgroup-tproxy.sh.cmake
+@@ -95,15 +95,15 @@ case $i in
+ esac
+ done
+ 
+-$enable_nftables && iptables=nftables || iptables=iptables
+-source @CMAKE_INSTALL_FULL_DATADIR@/cgproxy/scripts/$iptables.sh
++$enable_nftables && backend=nftables || backend=iptables
++source @CMAKE_INSTALL_FULL_DATADIR@/cgproxy/scripts/$backend.sh
+ 
+ $stop && { stop;exit 0; }
+ ## check cgroup_mount_point, create and mount if necessary
+-[ -z $cgroup_mount_point ] && { >&2 echo "$iptables: no cgroup2 mount point available"; exit -1; }
++[ -z $cgroup_mount_point ] && { >&2 echo "$backend: no cgroup2 mount point available"; exit -1; }
+ [ ! -d $cgroup_mount_point ] && mkdir -p $cgroup_mount_point
+ [ "$(findmnt -M $cgroup_mount_point -n -o FSTYPE)" != "cgroup2" ] && mount -t cgroup2 none $cgroup_mount_point
+-[ "$(findmnt -M $cgroup_mount_point -n -o FSTYPE)" != "cgroup2" ] && { >&2 echo "$iptables: mount $cgroup_mount_point failed"; exit -1; }
++[ "$(findmnt -M $cgroup_mount_point -n -o FSTYPE)" != "cgroup2" ] && { >&2 echo "$backend: mount $cgroup_mount_point failed"; exit -1; }
+ 
+ ## only create the first one in arrary
+ test -d $cgroup_mount_point$cgroup_proxy    || mkdir $cgroup_mount_point$cgroup_proxy   || exit -1; 
+@@ -112,14 +112,14 @@ test -d $cgroup_mount_point$cgroup_noproxy  || mkdir $cgroup_mount_point$cgroup_
+ ## filter cgroup that not exist
+ _cgroup_noproxy=()
+ for cg in ${cgroup_noproxy[@]}; do
+-    test -d $cgroup_mount_point$cg && _cgroup_noproxy+=($cg) || { >&2 echo "$iptables: $cg not exist, ignore";}
++    test -d $cgroup_mount_point$cg && _cgroup_noproxy+=($cg) || { >&2 echo "$backend: $cg not exist, ignore";}
+ done
+ unset cgroup_noproxy && cgroup_noproxy=${_cgroup_noproxy[@]}
+ 
+ ## filter cgroup that not exist
+ _cgroup_proxy=()
+ for cg in ${cgroup_proxy[@]}; do
+-    test -d $cgroup_mount_point$cg && _cgroup_proxy+=($cg) || { >&2 echo "$iptables: $cg not exist, ignore";}
++    test -d $cgroup_mount_point$cg && _cgroup_proxy+=($cg) || { >&2 echo "$backend: $cg not exist, ignore";}
+ done
+ unset cgroup_proxy && cgroup_proxy=${_cgroup_proxy[@]}
+ 
+@@ -127,6 +127,6 @@ start
+ 
+ ## message for user
+ cat << DOC
+-$iptables: noproxy cgroup: ${cgroup_noproxy[@]}
+-$iptables: proxied cgroup: ${cgroup_proxy[@]}
++$backend: noproxy cgroup: ${cgroup_noproxy[@]}
++$backend: proxied cgroup: ${cgroup_proxy[@]}
+ DOC
+
+From 0b2c9a4c8264c2c4464ac38b12a60b96adf364f6 Mon Sep 17 00:00:00 2001
+From: cubercsl <2014cais01@gmail.com>
+Date: Mon, 23 Jan 2023 15:53:11 +0800
+Subject: [PATCH 3/3] fix: add missing --on-ip equivalence in nft tproxy rules
+
+---
+ nftables.sh | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/nftables.sh b/nftables.sh
+index 9f09f0c..a140497 100644
+--- a/nftables.sh
++++ b/nftables.sh
+@@ -38,7 +38,8 @@ table inet cgproxy {
+     chain tproxy_ent {
+         # core
+         socket wildcard 0 mark set $fwmark_tproxy accept
+-        meta l4proto { tcp, udp } tproxy to :$port meta mark set $fwmark_tproxy
++        meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:$port meta mark set $fwmark_tproxy
++        meta l4proto { tcp, udp } tproxy ip6 to [::1]:$port meta mark set $fwmark_tproxy
+     }
+ 
+     chain tproxy_pre {
